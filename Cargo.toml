@@ -1,9 +1,9 @@
 [package]
 name = "cargo-unused"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/x-at-01/cargo-workspace-unused-pub"
+repository = "https://github.com/x-at-01/cargo-unused"
 categories = ["development-tools::cargo-plugins"]
 description = "Detect unused pub methods in a Rust workspace"
 
