@@ -14,9 +14,7 @@ use colored::Colorize;
 use itertools::Itertools;
 use log::*;
 use protobuf::Message;
-use scip::types::{
-    Document, Index, Occurrence, SymbolInformation, SymbolRole, symbol_information::Kind,
-};
+use scip::types::{Index, Occurrence, SymbolInformation, SymbolRole, symbol_information::Kind};
 
 #[derive(Parser)]
 #[command(name = "cargo")]
@@ -35,6 +33,16 @@ struct Flags {
     scip: Option<PathBuf>,
     #[clap(long, value_delimiter = ',', default_value = "rs,html")]
     extensions: Vec<String>,
+}
+
+/// Returns whether a SCIP symbol denotes a trait method declaration.
+///
+/// rust-analyzer declares a trait method as `.../Trait#method()`, whereas an impl
+/// method is `.../impl#[Type]method()` (the `impl#[` marker itself contains a `#`,
+/// hence the extra guard). Trait methods may be called implicitly, so they are
+/// skipped rather than reported.
+fn is_trait_method(symbol: &str) -> bool {
+    symbol.contains('#') && !symbol.contains("impl#[")
 }
 
 /// Returns whether a SCIP symbol denotes a trait method implementation.
@@ -138,20 +146,15 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
     let index = Index::parse_from_reader(&mut reader)?;
     debug!("Opened SCIP file with {} documents", index.documents.len());
 
-    // Record method/function and traits declarations
+    // Record method/function declarations, plus the document each is declared in
+    // (used to drop methods declared in test files).
     let mut declarations = HashMap::<&String, &SymbolInformation>::default();
-    let mut traits = HashSet::<&String>::default();
-    // Relative path of the document that declares each symbol, keyed by symbol.
-    // Used to drop methods declared in test files.
     let mut decl_paths = HashMap::<&str, &str>::default();
     for doc in &index.documents {
         for s in &doc.symbols {
             let Ok(kind) = s.kind.enum_value() else {
                 continue;
             };
-            if kind == Kind::Trait {
-                traits.insert(&s.display_name);
-            }
             if kind != Kind::Method && kind != Kind::Function {
                 continue;
             }
@@ -159,16 +162,18 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
             decl_paths.insert(s.symbol.as_str(), doc.relative_path.as_str());
         }
     }
-    debug!(
-        "Found {} declarations and {} traits",
-        declarations.len(),
-        traits.len()
-    );
+    debug!("Found {} declarations", declarations.len());
 
-    // Record occurrences
+    // Single pass over occurrences: remember each symbol's definition position and
+    // drop declarations that are referenced anywhere in the workspace.
+    let mut def_occ = HashMap::<&str, (&str, &Occurrence)>::default();
     for doc in &index.documents {
         for o in &doc.occurrences {
-            if (o.symbol_roles & SymbolRole::Definition as i32) == 0 {
+            if (o.symbol_roles & SymbolRole::Definition as i32) > 0 {
+                def_occ
+                    .entry(o.symbol.as_str())
+                    .or_insert((doc.relative_path.as_str(), o));
+            } else {
                 declarations.remove(&o.symbol);
             }
         }
@@ -188,15 +193,19 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
             && decl_paths
                 .get(d.symbol.as_str())
                 .is_none_or(|p| !p.contains("test"))
-            && traits.iter().all(|t| !d.symbol.contains(*t))
-            // Methods implementing an external trait (absent from the workspace
-            // symbol set) are also false positives; skip them structurally.
+            // Trait methods are called implicitly: declaration methods are
+            // `Trait#method()`, impl methods are `impl#[Type][Trait]method()`.
+            && !is_trait_method(&d.symbol)
             && !is_trait_impl(&d.symbol)
     });
     debug!(
         "Pass 2 (mains, tests, trait methods): {} candidates",
         declarations.len()
     );
+    if declarations.is_empty() {
+        info!("Found 0 possibly unused functions");
+        return Ok(());
+    }
 
     // Pass 3: Grep for candidates. Index candidate names by their display name so
     // each line is tokenized once instead of scanned against every declaration
@@ -243,29 +252,18 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
     let n_found = declarations.len();
     info!("Found {} possibly unused functions", n_found);
 
-    // Find occurrence with definition to get the position in the file
-    // TODO: Doing that earlier woud allow detecting the #[test], #[main], etc.
-    let mut declarations_occurrences: Vec<(&Document, &Occurrence)> = vec![];
-    for d in &index.documents {
-        for o in &d.occurrences {
-            if declarations.contains_key(&o.symbol)
-                && (o.symbol_roles & SymbolRole::Definition as i32) > 0
-            {
-                declarations_occurrences.push((d, o));
-                declarations.remove(&o.symbol);
-            }
-        }
-    }
-    // Group by file
-    let mut declarations_occurrences = declarations_occurrences
-        .into_iter()
-        .map(|(d, o)| (&d.relative_path, o))
+    // Group the surviving candidates by file, using the definition positions
+    // recorded during the single occurrence pass above.
+    let mut by_file = declarations
+        .keys()
+        .filter_map(|sym| def_occ.get(sym.as_str()))
+        .map(|(path, occ)| (*path, *occ))
         .into_group_map()
         .into_iter()
         .collect_vec();
-    declarations_occurrences.sort_by_key(|(d, _)| *d);
+    by_file.sort_by_key(|(path, _)| *path);
     // Display
-    for (path, mut occs) in declarations_occurrences {
+    for (path, mut occs) in by_file {
         let full_path = args.workspace.join(path);
         if !full_path.exists() {
             warn!("{} not found, is the SCIP file up-to-date?", path);
