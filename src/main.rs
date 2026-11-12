@@ -2,15 +2,21 @@
 // - Reduce the number of potential false positives by skipping non-pub methods.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
+use std::io::BufReader;
 use std::path::PathBuf;
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use colored::Colorize;
 use itertools::Itertools;
 use log::*;
 use protobuf::Message;
-use scip::types::Occurrence;
-use scip::types::{Document, SymbolInformation, SymbolRole, symbol_information::Kind};
+use scip::types::{
+    Document, Index, Occurrence, SymbolInformation, SymbolRole, symbol_information::Kind,
+};
 
 #[derive(Parser)]
 #[command(name = "cargo")]
@@ -68,16 +74,11 @@ fn is_trait_impl(symbol: &str) -> bool {
 
 /// Path to a fresh temporary file inside the system temp directory.
 fn temp_path(ext: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "cargo-unused-{}-{}.{}",
-        std::process::id(),
-        nanos,
-        ext
-    ))
+    env::temp_dir().join(format!("cargo-unused-{}-{}.{}", process::id(), nanos, ext))
 }
 
 /// Removes a generated temporary file (SCIP index or config) when dropped.
@@ -85,7 +86,7 @@ struct TempFile(PathBuf);
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -109,7 +110,7 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
     let _temp_scip = args.scip.is_none().then(|| TempFile(scip.clone()));
     if !scip.exists() {
         let config = temp_path("json");
-        std::fs::write(&config, RA_CONFIG)?;
+        fs::write(&config, RA_CONFIG)?;
         let _temp_config = TempFile(config.clone());
         info!(
             "Generating SCIP index with rust-analyzer into {:?}. This may take a while for large workspaces.",
@@ -132,9 +133,9 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
     info!("Running on {:?} with SCIP {:?}", args.workspace, scip);
 
     // Parse SCIP
-    let reader = std::fs::File::open(scip)?;
-    let mut reader = std::io::BufReader::new(reader);
-    let index = scip::types::Index::parse_from_reader(&mut reader)?;
+    let reader = fs::File::open(scip)?;
+    let mut reader = BufReader::new(reader);
+    let index = Index::parse_from_reader(&mut reader)?;
     debug!("Opened SCIP file with {} documents", index.documents.len());
 
     // Record method/function and traits declarations
@@ -142,7 +143,7 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
     let mut traits = HashSet::<&String>::default();
     // Relative path of the document that declares each symbol, keyed by symbol.
     // Used to drop methods declared in test files.
-    let mut decl_paths = HashMap::<String, String>::default();
+    let mut decl_paths = HashMap::<&str, &str>::default();
     for doc in &index.documents {
         for s in &doc.symbols {
             let Ok(kind) = s.kind.enum_value() else {
@@ -155,7 +156,7 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
                 continue;
             }
             declarations.insert(&s.symbol, s);
-            decl_paths.insert(s.symbol.clone(), doc.relative_path.clone());
+            decl_paths.insert(s.symbol.as_str(), doc.relative_path.as_str());
         }
     }
     debug!(
@@ -185,7 +186,7 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
             && d.display_name != "main"
             // Skip methods declared in test files (paths such as `tests/…`).
             && decl_paths
-                .get(&d.symbol)
+                .get(d.symbol.as_str())
                 .is_none_or(|p| !p.contains("test"))
             && traits.iter().all(|t| !d.symbol.contains(*t))
             // Methods implementing an external trait (absent from the workspace
@@ -197,8 +198,15 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
         declarations.len()
     );
 
-    // Pass 3: Grep for candidates
+    // Pass 3: Grep for candidates. Index candidate names by their display name so
+    // each line is tokenized once instead of scanned against every declaration
+    // (O(tokens) rather than O(lines × declarations)).
+    let by_name = declarations
+        .values()
+        .map(|d| (d.display_name.as_str(), &d.symbol))
+        .into_group_map();
     let mut counts = HashMap::<&String, usize>::default();
+    let mut seen = HashSet::<&String>::default();
     let extensions: HashSet<String> = args.extensions.into_iter().collect();
     walkdir::WalkDir::new(&args.workspace)
         .min_depth(1)
@@ -213,16 +221,24 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
                     .is_some_and(|e| extensions.contains(e))
         })
         .for_each(|f| {
-            let contents = std::fs::read_to_string(f.path()).unwrap();
+            let Ok(contents) = fs::read_to_string(f.path()) else {
+                return;
+            };
             for line in contents.lines() {
-                for d in declarations.values() {
-                    if line.contains(&d.display_name) {
-                        *counts.entry(&d.symbol).or_default() += 1;
+                seen.clear();
+                for tok in line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if let Some(syms) = by_name.get(tok) {
+                        for s in syms {
+                            // Count each line once per candidate, as before.
+                            if seen.insert(*s) {
+                                *counts.entry(*s).or_default() += 1;
+                            }
+                        }
                     }
                 }
             }
         });
-    declarations.retain(|d, _| counts.get(d).copied().unwrap_or_default() <= 1);
+    declarations.retain(|sym, _| counts.get(sym).copied().unwrap_or_default() <= 1);
     debug!("Pass 3 (search): {} candidates", declarations.len());
     let n_found = declarations.len();
     info!("Found {} possibly unused functions", n_found);
@@ -255,7 +271,7 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
             warn!("{} not found, is the SCIP file up-to-date?", path);
             continue;
         }
-        let lines = std::fs::read_to_string(full_path)?;
+        let lines = fs::read_to_string(full_path)?;
         let lines: Vec<&str> = lines.lines().collect();
         occs.sort_by_key(|occ| occ.range[0]);
         println!("{}", path.yellow());
@@ -272,6 +288,6 @@ fn main_impl(args: MainFlags) -> anyhow::Result<()> {
 fn main() {
     if let Err(e) = main_impl(MainFlags::parse()) {
         error!("{}", e);
-        std::process::exit(2);
+        process::exit(2);
     }
 }
