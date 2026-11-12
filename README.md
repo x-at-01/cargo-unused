@@ -1,4 +1,8 @@
-# cargo-workspace-unused-pub
+# cargo-unused
+
+> Fork of [`cargo-workspace-unused-pub`](https://github.com/cpg314/cargo-workspace-unused-pub):
+> skips false positives from trait impls (including traits from other crates) and
+> generates the SCIP index automatically into a temp directory.
 
 This cargo subcommand tries to detect `pub` methods that are unused in an entire workspace, by performing workspace-wide analysis.
 
@@ -15,10 +19,10 @@ See also the following discussions about this problem:
 ## Usage
 
 ```console
-$ cargo workspace-unused-pub --help
+$ cargo unused --help
 Detect unused pub methods in a workspace
 
-Usage: cargo workspace-unused-pub [OPTIONS] [WORKSPACE]
+Usage: cargo unused [OPTIONS] [WORKSPACE]
 
 Arguments:
   [WORKSPACE]  [default: current workspace]
@@ -34,7 +38,7 @@ Options:
 
 Detection is performed in multiple phases:
 
-1. Open [an SCIP code index](https://sourcegraph.com/blog/announcing-scip), or generate one with [rust-analyzer](https://rust-analyzer.github.io/).
+1. Open [an SCIP code index](https://sourcegraph.com/blog/announcing-scip), or generate one with [rust-analyzer](https://rust-analyzer.github.io/). When `--scip` is not given, the index is generated automatically into the system temp directory and removed afterwards, so no manual step is needed and the workspace is never polluted with an `index.scip`.
 
    ```
    Opened SCIP file with 806 documents

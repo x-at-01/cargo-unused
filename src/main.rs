@@ -16,7 +16,7 @@ use scip::types::{Document, SymbolInformation, SymbolRole, symbol_information::K
 #[command(name = "cargo")]
 #[command(bin_name = "cargo")]
 enum MainFlags {
-    WorkspaceUnusedPub(Flags),
+    Unused(Flags),
 }
 
 /// Detect unused pub methods in a workspace.
@@ -73,7 +73,7 @@ fn temp_path(ext: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "cargo-workspace-unused-pub-{}-{}.{}",
+        "cargo-unused-{}-{}.{}",
         std::process::id(),
         nanos,
         ext
@@ -95,7 +95,7 @@ impl Drop for TempFile {
 const RA_CONFIG: &str = r#"{"cargo":{"allTargets":false},"cfg":{"setTest":false}}"#;
 
 fn main_impl(args: MainFlags) -> anyhow::Result<()> {
-    let MainFlags::WorkspaceUnusedPub(args) = args;
+    let MainFlags::Unused(args) = args;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     if !args.workspace.join("Cargo.toml").exists() {
